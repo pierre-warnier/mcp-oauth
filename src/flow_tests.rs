@@ -915,3 +915,276 @@ async fn pkce_mismatch_counts_for_dcr_and_cimd_clients() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// The CIMD flows of the three vendor clients through the production HTTP
+/// fetcher against a local HTTPS server (fixtures mimic the published
+/// documents; nothing leaves the machine), allowlist on: Claude (public),
+/// Claude Code (public, loopback redirect, any port), ChatGPT
+/// (private_key_jwt with jwks_uri, assertion replay and missing jti
+/// rejected). Documents are fetched once; a URL outside the allowlist is
+/// never fetched; fetch failures and discovery probes are not counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cimd_over_https_vendor_clients() {
+    use crate::cimd::{
+        Cimd,
+        tests::{CHATGPT, CLAUDE_CODE},
+    };
+    use crate::test_https::{LocalResolver, Route, Server, ca};
+    let srv = Server::start().await;
+    let claude = srv.url("claude", "/oauth/mcp-oauth-client-metadata");
+    let code_cli = srv.url("claude", "/oauth/claude-code-client-metadata");
+    let gpt = srv.url("chatgpt", "/oauth/client.json");
+    let jwks = srv.url("chatgpt", "/oauth/jwks.json");
+    let outsider = srv.url("evil", "/evil.json");
+    let flaky = srv.url("flaky", "/client.json");
+    srv.route(
+        "/oauth/mcp-oauth-client-metadata",
+        Route::json(CLAUDE_DOC.replace(CLAUDE, &claude)),
+    );
+    srv.route(
+        "/oauth/claude-code-client-metadata",
+        Route::json(CLAUDE_CODE_DOC.replace(CLAUDE_CODE, &code_cli)),
+    );
+    srv.route(
+        "/oauth/client.json",
+        Route::json(CHATGPT_DOC.replace(CHATGPT, &gpt).replace(JWKS, &jwks)),
+    );
+    srv.route(
+        "/evil.json",
+        Route::json(CLAUDE_DOC.replace(CLAUDE, &outsider)),
+    );
+    let signer = Signer::rsa("RS256");
+    srv.route(
+        "/oauth/jwks.json",
+        Route::json(json!({"keys":[signer.jwk("k1")]}).to_string()),
+    );
+    srv.route(
+        "/client.json",
+        Route {
+            status: 503,
+            content_length: true,
+            ..Default::default()
+        },
+    );
+
+    let dir = tmp_dir("cimd-https");
+    let mut c = config(&dir, &crate::hash_password(PW).unwrap());
+    c.cimd_allowlist = Some(vec![
+        claude.clone(),
+        code_cli.clone(),
+        gpt.clone(),
+        flaky.clone(),
+    ]);
+    let cimd = Cimd::new_http_for_tests(c.redirect_patterns.clone(), LocalResolver, ca());
+    let o = OAuth::with_cimd(c, cimd).unwrap();
+    let app = app_with(
+        &o,
+        Limits {
+            max_failures: 3,
+            per_ip_burst: 1000.0,
+            ..Default::default()
+        },
+    );
+
+    // Claude.
+    let cb = "https://claude.ai/api/mcp/auth_callback";
+    let code = authorize(&app, &claude, cb, &["<b>Claude</b>"]).await;
+    let (access, _) =
+        tokens(&send(&app, form("/oauth/token", &exchange(&claude, &code, cb))).await);
+    assert_eq!(send(&app, mcp(Some(&access))).await.body, claude);
+
+    // Claude Code: loopback redirect on an ephemeral port.
+    let loopback = "http://127.0.0.1:43117/callback";
+    let code = authorize(&app, &code_cli, loopback, &["Claude Code"]).await;
+    let (access, _) = tokens(
+        &send(
+            &app,
+            form("/oauth/token", &exchange(&code_cli, &code, loopback)),
+        )
+        .await,
+    );
+    assert_eq!(send(&app, mcp(Some(&access))).await.body, code_cli);
+
+    // ChatGPT probes OpenID discovery first: 404, not counted (max 3).
+    for _ in 0..5 {
+        let r = send(&app, get("/.well-known/openid-configuration")).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+    // ChatGPT, private_key_jwt with keys from jwks_uri.
+    let gcb = "https://chatgpt.com/connector_platform_oauth_redirect";
+    let token_url = "https://ytg.test/oauth/token";
+    let now = crate::oauth::unix_now();
+    let code = authorize(&app, &gpt, gcb, &["<b>ChatGPT</b>"]).await;
+    let good = signer.sign(Some("k1"), &claims(&gpt, token_url, now));
+    let mut ex = exchange(&gpt, &code, gcb);
+    ex.push(("client_assertion_type", crate::jwt::ASSERTION_TYPE));
+    ex.push(("client_assertion", &good));
+    let (access, refresh) = tokens(&send(&app, form("/oauth/token", &ex)).await);
+    assert_eq!(send(&app, mcp(Some(&access))).await.body, gpt);
+    let refresh_with = |assertion: String| {
+        let v = [
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh.clone()),
+            ("client_id", gpt.clone()),
+            (
+                "client_assertion_type",
+                crate::jwt::ASSERTION_TYPE.to_string(),
+            ),
+            ("client_assertion", assertion),
+        ];
+        let p: Vec<(&str, &str)> = v.iter().map(|(k, x)| (*k, x.as_str())).collect();
+        form("/oauth/token", &p)
+    };
+    // Replayed assertion (same jti): refused, counted (1).
+    let r = send(&app, refresh_with(good.clone())).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    // An assertion without jti (replayable): refused, counted (2).
+    let mut no_jti = claims(&gpt, token_url, now);
+    no_jti.as_object_mut().unwrap().remove("jti");
+    let r = send(&app, refresh_with(signer.sign(Some("k1"), &no_jti))).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    // A fresh assertion still refreshes.
+    let fresh = signer.sign(Some("k1"), &claims(&gpt, token_url, now));
+    let r = send(&app, refresh_with(fresh)).await;
+    let (access, _) = tokens(&r);
+
+    // Outside the allowlist: refused at both endpoints, never fetched.
+    let q = serde_urlencoded::to_string([
+        ("response_type", "code"),
+        ("client_id", outsider.as_str()),
+        ("redirect_uri", cb),
+        ("code_challenge", challenge().as_str()),
+        ("code_challenge_method", "S256"),
+    ])
+    .unwrap();
+    for _ in 0..5 {
+        let r = send(&app, get(&format!("/oauth/authorize?{q}"))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let r = send(&app, form("/oauth/token", &exchange(&outsider, "x", cb))).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        // Allowlisted but its server fails: 400 page / 503, not counted.
+        let qf = q.replace(
+            &serde_urlencoded::to_string([("c", outsider.as_str())]).unwrap()[2..],
+            &serde_urlencoded::to_string([("c", flaky.as_str())]).unwrap()[2..],
+        );
+        let r = send(&app, get(&format!("/oauth/authorize?{qf}"))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+        let r = send(&app, form("/oauth/token", &exchange(&flaky, "x", cb))).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+    }
+    assert_eq!(
+        srv.hits("/evil.json"),
+        0,
+        "outside the allowlist: never fetched"
+    );
+    assert_eq!(srv.hits("/client.json"), 10, "errors are not cached");
+    assert_eq!(srv.hits("/oauth/mcp-oauth-client-metadata"), 1, "cached");
+    assert_eq!(srv.hits("/oauth/claude-code-client-metadata"), 1);
+    assert_eq!(srv.hits("/oauth/client.json"), 1);
+    assert_eq!(srv.hits("/oauth/jwks.json"), 1);
+    // Two counted failures (replay, no jti), max 3: not banned.
+    assert_eq!(send(&app, mcp(Some(&access))).await.body, gpt);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Measurement, not a check: `cargo test --release -- --ignored
+/// cimd_fetch_memory --nocapture`. 60 concurrent authorize requests from 60
+/// IPs whose client_id URLs are (a) outside the allowlist, (b) one
+/// allowlisted document that takes 3 s, (c) 60 distinct documents that take
+/// 3 s each (no allowlist). Prints the peak RSS over the run (VmHWM reset
+/// before each scenario), fetches and connections at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "measurement"]
+async fn cimd_fetch_memory() {
+    use crate::cimd::Cimd;
+    use crate::test_https::{LocalResolver, Route, Server, ca};
+    fn kib(k: &str) -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        s.lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let cb = "https://claude.ai/api/mcp/auth_callback";
+    for (name, allow, distinct) in [
+        ("(a) 60 URLs outside the allowlist", true, true),
+        ("(b) 1 allowlisted slow URL x 60", true, false),
+        ("(c) 60 distinct slow URLs, no allowlist", false, true),
+    ] {
+        let srv = Server::start().await;
+        let urls: Vec<String> = (0..60)
+            .map(|i| {
+                let path = if distinct {
+                    format!("/doc/{i}")
+                } else {
+                    "/doc/0".into()
+                };
+                srv.url("x", &path)
+            })
+            .collect();
+        for u in &urls {
+            let path = &u[u.find("/doc").unwrap()..];
+            srv.route(
+                path,
+                Route::json(CLAUDE_DOC.replace(CLAUDE, u))
+                    .delayed(std::time::Duration::from_secs(3)),
+            );
+        }
+        let dir = tmp_dir("cimd-mem");
+        let mut c = config(&dir, &crate::hash_password(PW).unwrap());
+        c.cimd_allowlist = match (allow, distinct) {
+            (true, true) => Some(vec![srv.url("x", "/allowed")]),
+            (true, false) => Some(vec![urls[0].clone()]),
+            _ => None,
+        };
+        let cimd = Cimd::new_http_for_tests(c.redirect_patterns.clone(), LocalResolver, ca());
+        let o = OAuth::with_cimd(c, cimd).unwrap();
+        let app = app_with(
+            &o,
+            Limits {
+                max_concurrency: 64,
+                ..Default::default()
+            },
+        );
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let base = kib("VmRSS:");
+        let t = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for (i, u) in urls.iter().enumerate() {
+            let q = serde_urlencoded::to_string([
+                ("response_type", "code"),
+                ("client_id", u.as_str()),
+                ("redirect_uri", cb),
+                ("code_challenge", challenge().as_str()),
+                ("code_challenge_method", "S256"),
+            ])
+            .unwrap();
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                let req = Request::get(format!("/oauth/authorize?{q}"))
+                    .header("cf-connecting-ip", format!("203.0.113.{}", i + 1))
+                    .body(Body::empty())
+                    .unwrap();
+                send(&app, req).await.status
+            }));
+        }
+        let mut codes = std::collections::BTreeMap::new();
+        for t in tasks {
+            *codes.entry(t.await.unwrap().as_u16()).or_insert(0) += 1;
+        }
+        let took = t.elapsed();
+        let peak = kib("VmHWM:");
+        let after = kib("VmRSS:");
+        println!(
+            "{name}: RSS base {base} KiB, peak +{} KiB, after +{} KiB; fetches {}, \
+             connections at once {}; answers {codes:?}; {took:.1?}",
+            peak.saturating_sub(base),
+            after.saturating_sub(base),
+            srv.total_hits(),
+            srv.max_active(),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

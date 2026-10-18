@@ -57,6 +57,8 @@ mod password;
 
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod test_https;
 
 pub use guard::{AuthFailures, Guard, Limits, Verdict, client_ip, protect};
 pub use oauth::{

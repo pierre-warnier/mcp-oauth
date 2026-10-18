@@ -4,6 +4,12 @@
 //! 64 KiB max, no redirects, public IP addresses only), validated, and cached
 //! in memory for an hour; on a transport error a cached copy up to a day old
 //! is still used. Errors and invalid documents are never cached.
+//!
+//! Outgoing fetches (documents and `jwks_uri` key sets) are bounded: at most
+//! [`MAX_FETCHES`] at once (a caller waits up to the fetch timeout for a
+//! slot, then gets "unavailable"), concurrent callers for the same URL share
+//! one fetch and its result, and no idle connection is kept. The allowlist,
+//! when set, is checked by the callers before anything is fetched.
 
 use crate::jwt::{self, Jwk};
 use crate::oauth::{is_loopback, pattern_matches, uri_parts};
@@ -21,6 +27,8 @@ const JWKS_REFETCH: Duration = Duration::from_secs(60);
 const MAX_ENTRIES: usize = 256;
 const MAX_REDIRECT_URIS: usize = 64;
 const MAX_URL: usize = 512;
+/// Outgoing fetches at once, documents and key sets together.
+pub const MAX_FETCHES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuthMethod {
@@ -47,7 +55,7 @@ impl ClientDoc {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CimdError {
     /// Network trouble or a server error at the client: try again later.
     Unavailable(String),
@@ -135,7 +143,7 @@ fn public_v4(a: Ipv4Addr) -> bool {
 
 /// DNS resolver that drops special-purpose addresses, so a public name
 /// pointing at a private address is not fetched either.
-struct PublicOnly;
+pub(crate) struct PublicOnly;
 
 impl reqwest::dns::Resolve for PublicOnly {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -260,6 +268,35 @@ pub fn parse_doc(url: &str, body: &[u8], patterns: &[String]) -> Result<ClientDo
     })
 }
 
+/// The production HTTP client (5 s timeouts, no redirects, https only, no
+/// proxy, no idle connections) with `resolver`; tests add their own root
+/// certificate and a resolver for a local server.
+fn http_client(
+    resolver: impl reqwest::dns::Resolve + 'static,
+    #[cfg(test)] roots: Option<reqwest::Certificate>,
+) -> Result<reqwest::Client, String> {
+    let b = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .connect_timeout(FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .no_proxy()
+        // Fetches are rare (cached an hour): an idle connection kept per
+        // host would only be memory an attacker can multiply.
+        .pool_max_idle_per_host(0)
+        .dns_resolver(std::sync::Arc::new(resolver))
+        .user_agent(concat!("mcp-oauth/", env!("CARGO_PKG_VERSION")));
+    #[cfg(test)]
+    let b = match roots {
+        Some(c) => b.tls_certs_only([c]),
+        None => b,
+    };
+    b.build().map_err(|e| format!("CIMD HTTP client: {e}"))
+}
+
+/// One fetch in progress, shared by everyone asking for the same URL.
+type Shared = Arc<tokio::sync::OnceCell<Result<Arc<Vec<u8>>, CimdError>>>;
+
 enum Fetcher {
     Http(reqwest::Client),
     /// Tests: URL -> (status, body).
@@ -319,6 +356,28 @@ impl Fetcher {
     }
 }
 
+/// Drops the shared fetch of `url` once it is done or nobody waits for it
+/// any more (cancelled requests included), so the map holds only fetches in
+/// progress.
+struct Leave<'a> {
+    cimd: &'a Cimd,
+    url: &'a str,
+    shared: Shared,
+}
+
+impl Drop for Leave<'_> {
+    fn drop(&mut self) {
+        let mut m = self.cimd.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        // Clones are only made under this lock: map + this one = nobody else.
+        if m.get(self.url).is_some_and(|s| {
+            Arc::ptr_eq(s, &self.shared)
+                && (s.initialized() || Arc::strong_count(&self.shared) <= 2)
+        }) {
+            m.remove(self.url);
+        }
+    }
+}
+
 struct Entry {
     doc: Arc<ClientDoc>,
     fetched: Instant,
@@ -330,34 +389,72 @@ pub struct Cimd {
     fetcher: Fetcher,
     patterns: Vec<String>,
     cache: Mutex<HashMap<String, Entry>>,
+    /// Bounds the outgoing fetches ([`MAX_FETCHES`]).
+    fetch_slots: tokio::sync::Semaphore,
+    /// URL -> fetch in progress.
+    inflight: Mutex<HashMap<String, Shared>>,
 }
 
 impl Cimd {
     pub fn new(patterns: Vec<String>) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .connect_timeout(FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .https_only(true)
-            .no_proxy()
-            .dns_resolver(PublicOnly)
-            .user_agent(concat!("mcp-oauth/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| format!("CIMD HTTP client: {e}"))?;
-        Ok(Self {
-            fetcher: Fetcher::Http(client),
+        #[cfg(not(test))]
+        let client = http_client(PublicOnly)?;
+        #[cfg(test)]
+        let client = http_client(PublicOnly, None)?;
+        Ok(Self::with_fetcher(Fetcher::Http(client), patterns))
+    }
+
+    fn with_fetcher(fetcher: Fetcher, patterns: Vec<String>) -> Self {
+        Self {
+            fetcher,
             patterns,
             cache: Mutex::new(HashMap::new()),
-        })
+            fetch_slots: tokio::sync::Semaphore::new(MAX_FETCHES),
+            inflight: Mutex::new(HashMap::new()),
+        }
     }
 
     #[cfg(test)]
     pub fn new_static(patterns: Vec<String>) -> Self {
-        Self {
-            fetcher: Fetcher::Static(Mutex::new(HashMap::new())),
-            patterns,
-            cache: Mutex::new(HashMap::new()),
-        }
+        Self::with_fetcher(Fetcher::Static(Mutex::new(HashMap::new())), patterns)
+    }
+
+    /// Tests: the production HTTP fetcher, but resolving every name to
+    /// `resolver` and trusting only `ca` (a local HTTPS server).
+    #[cfg(test)]
+    pub fn new_http_for_tests(
+        patterns: Vec<String>,
+        resolver: impl reqwest::dns::Resolve + 'static,
+        ca: reqwest::Certificate,
+    ) -> Self {
+        let client = http_client(resolver, Some(ca)).expect("test HTTP client");
+        Self::with_fetcher(Fetcher::Http(client), patterns)
+    }
+
+    /// Fetch `url`: one fetch per URL at a time (concurrent callers get its
+    /// result), at most [`MAX_FETCHES`] fetches at once.
+    async fn fetch(&self, url: &str) -> Result<Arc<Vec<u8>>, CimdError> {
+        let leave = Leave {
+            cimd: self,
+            url,
+            shared: {
+                let mut m = self.inflight.lock().expect("cimd inflight lock");
+                m.entry(url.to_string()).or_default().clone()
+            },
+        };
+        leave
+            .shared
+            .get_or_init(|| async {
+                let slot = tokio::time::timeout(FETCH_TIMEOUT, self.fetch_slots.acquire()).await;
+                let Ok(Ok(_slot)) = slot else {
+                    return Err(CimdError::Unavailable(format!(
+                        "not fetching {url}: {MAX_FETCHES} client metadata fetches in progress"
+                    )));
+                };
+                self.fetcher.get(url).await.map(Arc::new)
+            })
+            .await
+            .clone()
     }
 
     /// Tests: serve `body` with `status` at `url`.
@@ -395,7 +492,7 @@ impl Cimd {
             Some(e) if now.duration_since(e.fetched) < STALE_OK => Some(e.doc.clone()),
             _ => None,
         };
-        let body = match self.fetcher.get(url).await {
+        let body = match self.fetch(url).await {
             Ok(b) => b,
             Err(CimdError::Unavailable(e)) => {
                 return match stale {
@@ -462,7 +559,7 @@ impl Cimd {
                 return Ok(k);
             }
         }
-        let body = self.fetcher.get(uri).await?;
+        let body = self.fetch(uri).await?;
         let keys = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
             .as_ref()
@@ -742,6 +839,237 @@ pub(crate) mod tests {
 
     /// Fetches the real vendor documents through the production fetcher
     /// (network): `cargo test -- --ignored live_vendor_documents`.
+    use crate::test_https::{LocalResolver, Route, Server, ca};
+
+    async fn http(patterns: Vec<String>) -> (Server, Cimd) {
+        let srv = Server::start().await;
+        (srv, Cimd::new_http_for_tests(patterns, LocalResolver, ca()))
+    }
+
+    fn doc_for(url: &str) -> String {
+        CLAUDE_DOC.replace(CLAUDE, url)
+    }
+
+    /// The production HTTP client against a local HTTPS server: 64 KiB cap
+    /// (with and without content-length), no redirects followed, 5xx is
+    /// "unavailable", 4xx "invalid", 5 s timeout, https only.
+    #[tokio::test]
+    async fn http_fetch_rules() {
+        let (srv, c) = http(patterns()).await;
+        let ok = srv.url("a", "/doc");
+        srv.route("/doc", Route::json(doc_for(&ok)));
+        let d = c.get(&ok).await.unwrap();
+        assert_eq!(d.client_name.as_deref(), Some("Claude"));
+        assert!(c.get(&ok).await.is_ok());
+        assert_eq!(srv.hits("/doc"), 1, "cached");
+
+        for (path, cl) in [("/big", true), ("/big-chunked", false)] {
+            let url = srv.url("a", path);
+            let mut body = doc_for(&url).into_bytes();
+            body.resize(MAX_DOC + 1, b' ');
+            srv.route(
+                path,
+                Route {
+                    content_length: cl,
+                    ..Route::json(body)
+                },
+            );
+            match c.get(&url).await {
+                Err(CimdError::Invalid(e)) => assert!(e.contains("64 KiB"), "{e}"),
+                r => panic!("{path}: {r:?}"),
+            }
+        }
+        let url = srv.url("a", "/exactly-64k");
+        let mut body = doc_for(&url).into_bytes();
+        body.resize(MAX_DOC, b' ');
+        srv.route(
+            "/exactly-64k",
+            Route {
+                content_length: false,
+                ..Route::json(body)
+            },
+        );
+        assert!(c.get(&url).await.is_ok(), "64 KiB is fine");
+
+        let target = srv.url("a", "/target");
+        srv.route("/target", Route::json(doc_for(&srv.url("a", "/redirect"))));
+        srv.route(
+            "/redirect",
+            Route {
+                status: 302,
+                headers: vec![("location".into(), target.clone())],
+                content_length: true,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            c.get(&srv.url("a", "/redirect")).await,
+            Err(CimdError::Invalid(_))
+        ));
+        assert_eq!(srv.hits("/target"), 0, "redirect not followed");
+
+        srv.route(
+            "/500",
+            Route {
+                status: 500,
+                content_length: true,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            c.get(&srv.url("a", "/500")).await,
+            Err(CimdError::Unavailable(_))
+        ));
+        assert!(matches!(
+            c.get(&srv.url("a", "/404")).await,
+            Err(CimdError::Invalid(_))
+        ));
+
+        srv.route(
+            "/slow",
+            Route::json(doc_for(&srv.url("a", "/slow"))).delayed(Duration::from_secs(30)),
+        );
+        let t = Instant::now();
+        let r = c.get(&srv.url("a", "/slow")).await;
+        let took = t.elapsed();
+        assert!(matches!(r, Err(CimdError::Unavailable(_))), "{r:?}");
+        assert!(
+            took >= FETCH_TIMEOUT && took < FETCH_TIMEOUT + Duration::from_secs(2),
+            "{took:?}"
+        );
+
+        // http:// is refused by the URL check and by the client itself.
+        let plain = format!("http://a.cimd.test:{}/doc", srv.port);
+        assert!(matches!(c.get(&plain).await, Err(CimdError::Invalid(_))));
+        assert!(matches!(
+            c.fetcher.get(&plain).await,
+            Err(CimdError::Unavailable(_))
+        ));
+        assert_eq!(
+            srv.total_hits(),
+            1 + 2 + 1 + 1 + 1 + 1 + 1,
+            "nothing else reached the server"
+        );
+    }
+
+    /// 60 concurrent requests for one slow document: one fetch, everybody
+    /// gets the result; 40 distinct slow documents: never more than
+    /// MAX_FETCHES connections at once, all served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fetches_shared_and_bounded() {
+        let (srv, c) = http(patterns()).await;
+        let c = Arc::new(c);
+        let one = srv.url("a", "/one");
+        srv.route(
+            "/one",
+            Route::json(doc_for(&one)).delayed(Duration::from_millis(300)),
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..60 {
+            let (c, one) = (c.clone(), one.clone());
+            tasks.push(tokio::spawn(async move { c.get(&one).await }));
+        }
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert_eq!(srv.hits("/one"), 1, "one fetch for 60 callers");
+        assert!(c.inflight.lock().unwrap().is_empty());
+
+        // Errors are shared too (and not cached).
+        srv.route(
+            "/bad",
+            Route {
+                status: 500,
+                content_length: true,
+                delay: Duration::from_millis(300),
+                ..Default::default()
+            },
+        );
+        let bad = srv.url("a", "/bad");
+        let mut tasks = Vec::new();
+        for _ in 0..30 {
+            let (c, bad) = (c.clone(), bad.clone());
+            tasks.push(tokio::spawn(async move { c.get(&bad).await }));
+        }
+        for t in tasks {
+            assert!(matches!(t.await.unwrap(), Err(CimdError::Unavailable(_))));
+        }
+        assert_eq!(srv.hits("/bad"), 1);
+
+        let mut tasks = Vec::new();
+        for i in 0..40 {
+            let path = format!("/many/{i}");
+            let url = srv.url("a", &path);
+            srv.route(
+                &path,
+                Route::json(doc_for(&url)).delayed(Duration::from_millis(200)),
+            );
+            let c = c.clone();
+            tasks.push(tokio::spawn(async move { c.get(&url).await }));
+        }
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert!(
+            srv.max_active() <= MAX_FETCHES,
+            "{} connections at once",
+            srv.max_active()
+        );
+        assert!(srv.max_active() >= 2, "fetches do run in parallel");
+        assert!(c.inflight.lock().unwrap().is_empty());
+    }
+
+    /// A caller that gives up (request cancelled) does not leave its fetch
+    /// behind, and a waiter takes over.
+    #[tokio::test]
+    async fn cancelled_fetch_cleans_up() {
+        let (srv, c) = http(patterns()).await;
+        let url = srv.url("a", "/c");
+        srv.route(
+            "/c",
+            Route::json(doc_for(&url)).delayed(Duration::from_millis(300)),
+        );
+        let r = tokio::time::timeout(Duration::from_millis(50), c.get(&url)).await;
+        assert!(r.is_err(), "timed out");
+        assert!(c.inflight.lock().unwrap().is_empty(), "nothing left behind");
+        assert!(c.get(&url).await.is_ok());
+    }
+
+    /// All fetch slots busy for longer than the fetch timeout: the caller
+    /// gets "unavailable" and nothing is fetched.
+    #[tokio::test]
+    async fn fetch_slots_full() {
+        let (srv, c) = http(patterns()).await;
+        let url = srv.url("a", "/doc");
+        srv.route("/doc", Route::json(doc_for(&url)));
+        let held = c
+            .fetch_slots
+            .acquire_many(MAX_FETCHES as u32)
+            .await
+            .unwrap();
+        let t = Instant::now();
+        match c.get(&url).await {
+            Err(CimdError::Unavailable(e)) => assert!(e.contains("in progress"), "{e}"),
+            r => panic!("{r:?}"),
+        }
+        assert!(t.elapsed() >= FETCH_TIMEOUT);
+        assert_eq!(srv.total_hits(), 0);
+        drop(held);
+        assert!(c.get(&url).await.is_ok());
+    }
+
+    /// The production resolver refuses names that resolve to special-purpose
+    /// addresses (offline: `localhost` from /etc/hosts).
+    #[tokio::test]
+    async fn public_only_resolver() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let r = PublicOnly.resolve(name).await;
+        let e = r.err().expect("refused").to_string();
+        assert!(e.contains("no public address"), "{e}");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_vendor_documents() {

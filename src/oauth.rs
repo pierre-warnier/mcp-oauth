@@ -774,7 +774,7 @@ impl OAuth {
         Self::with_cimd(cfg, cimd)
     }
 
-    fn with_cimd(mut cfg: Config, cimd: Cimd) -> Result<Self, String> {
+    pub(crate) fn with_cimd(mut cfg: Config, cimd: Cimd) -> Result<Self, String> {
         cfg.issuer = cfg.issuer.trim_end_matches('/').to_string();
         let local = ["http://localhost", "http://127.0.0.1"]
             .iter()
@@ -1702,21 +1702,21 @@ impl OAuth {
                 })?;
             }
         }
-        if let Some(j) = a.claims.jti.as_deref() {
-            let key = format!("{} {j}", doc.client_id);
-            let exp = a.claims.exp.unwrap_or(0.0).max(0.0) as u64 + 60;
-            let mut st = self.lock();
-            st.used_jtis.retain(|_, e| *e > now);
-            if st.used_jtis.contains_key(&key) {
-                return Err(rejected("client assertion replayed (jti already used)"));
-            }
-            if st.used_jtis.len() >= MAX_JTIS {
-                return Err(AssertionError::Unavailable(
-                    "too many recent client assertions".into(),
-                ));
-            }
-            st.used_jtis.insert(key, exp);
+        // check_claims requires the jti.
+        let j = a.claims.jti.as_deref().unwrap_or_default();
+        let key = format!("{} {j}", doc.client_id);
+        let exp = a.claims.exp.unwrap_or(0.0).max(0.0) as u64 + 60;
+        let mut st = self.lock();
+        st.used_jtis.retain(|_, e| *e > now);
+        if st.used_jtis.contains_key(&key) {
+            return Err(rejected("client assertion replayed (jti already used)"));
         }
+        if st.used_jtis.len() >= MAX_JTIS {
+            return Err(AssertionError::Unavailable(
+                "too many recent client assertions".into(),
+            ));
+        }
+        st.used_jtis.insert(key, exp);
         Ok(())
     }
 }

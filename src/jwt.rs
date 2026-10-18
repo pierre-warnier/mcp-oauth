@@ -246,11 +246,15 @@ impl Assertion {
         if c.nbf.is_some_and(|t| t > now_f + skew) || c.iat.is_some_and(|t| t > now_f + skew) {
             return Err("client assertion not valid yet");
         }
-        if c.jti
-            .as_deref()
-            .is_some_and(|j| j.is_empty() || j.len() > 256)
-        {
-            return Err("bad client assertion jti");
+        // Required (OpenID Connect Core 9 for private_key_jwt; RFC 7523
+        // leaves it optional): without it an assertion could be replayed
+        // for its whole lifetime.
+        match c.jti.as_deref() {
+            None => return Err("client assertion without jti"),
+            Some(j) if j.is_empty() || j.len() > 256 => {
+                return Err("bad client assertion jti");
+            }
+            Some(_) => {}
         }
         Ok(())
     }
@@ -483,7 +487,10 @@ pub(crate) mod tests {
         assert_eq!(check(v), Err("client assertion not valid yet"));
         let mut v = claims(cid, tok, now);
         v["jti"] = json!("");
-        assert!(check(v).is_err());
+        assert_eq!(check(v), Err("bad client assertion jti"));
+        let mut v = claims(cid, tok, now);
+        v.as_object_mut().unwrap().remove("jti");
+        assert_eq!(check(v), Err("client assertion without jti"), "replayable");
         assert_eq!(
             unverified_subject(&Signer::es256().sign(None, &claims(cid, tok, now))).as_deref(),
             Some(cid)

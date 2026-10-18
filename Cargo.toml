@@ -21,13 +21,16 @@ serde_json = "1.0.154"
 serde_urlencoded = "0.7"
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1.53.3", features = ["rt", "net"] }
+tokio = { version = "1.53.3", features = ["rt", "net", "sync", "time"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["timeout", "limit"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tower = { version = "0.5", features = ["util"] }
+# Local HTTPS server for the CIMD fetcher tests (already in the dependency
+# graph through reqwest).
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 
 # Argon2 is unusably slow unoptimised; keep tests and debug builds fast.
 [profile.dev.package.argon2]

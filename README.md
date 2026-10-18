@@ -62,7 +62,12 @@ connect", "Owner password"; nothing else is shown about the owner.
   redirects, no proxy, only public IP addresses (RFC 6890 special-purpose
   ranges are refused by the resolver, IP literals by the URL check), cached in
   memory 1 h (a copy up to 24 h old is used if a refetch hits a network error;
-  errors and invalid documents are never cached). The document must contain
+  errors and invalid documents are never cached). At most 8 fetches run at
+  once (documents and `jwks_uri` key sets together; a request waits up to
+  5 s for a slot, then gets "unavailable"), concurrent requests for the same
+  URL share one fetch and its result, and no idle connection is kept. With an
+  allowlist, a `client_id` outside it is refused before anything is fetched,
+  at `/oauth/authorize` and at the token endpoint. The document must contain
   `client_id` equal to the URL and `redirect_uris`; it must not contain a
   client secret. Its `redirect_uris` are filtered by the redirect patterns and
   the authorization request must use one of the rest (loopback port ignored).
@@ -70,7 +75,9 @@ connect", "Owner password"; nothing else is shown about the owner.
   `token_endpoint_auth_methods_supported` of the document if present (ChatGPT),
   else `token_endpoint_auth_method`, else `none`; accepted are `none` (PKCE
   only) and `private_key_jwt` (RFC 7523: `iss` = `sub` = client_id, `aud` the
-  issuer or the token endpoint, `exp` within an hour, single-use `jti`;
+  issuer or the token endpoint, `exp` within an hour, a `jti` (required, as
+  in OpenID Connect Core section 9; without it an assertion could be replayed)
+  that is single-use;
   RS256, PS256 or ES256 against `jwks` or `jwks_uri`, refetched at most once a
   minute on an unknown `kid`). The consent page shows the document's name and
   the host of the `client_id`. CIMD clients are never written to disk.
@@ -197,8 +204,14 @@ client out.
 ## Tests
 
 `cargo test`: unit tests per module and end-to-end flows (`src/flow_tests.rs`:
-DCR, CIMD public and `private_key_jwt`, allowlist, failure counting), with
-CIMD documents served from memory. `cargo test -- --ignored
+DCR, CIMD public and `private_key_jwt`, allowlist and DCR grace, failure
+counting, password check bound), with CIMD documents served from memory, and
+the production HTTP fetcher against a local HTTPS server (`src/test_https.rs`,
+test CA in `src/testdata/`, every `*.cimd.test` name resolved to it, nothing
+leaves the machine): size cap, redirects, timeout, shared and bounded
+fetches, and the Claude, Claude Code and ChatGPT flows end to end.
+`cargo test --release -- --ignored cimd_fetch_memory --nocapture` prints the
+memory and fetch counts of 60 concurrent authorize requests with CIMD URLs. `cargo test -- --ignored
 live_vendor_documents` fetches the real Claude, Claude Code and ChatGPT
 documents and ChatGPT's JWKS through the production fetcher and checks that a
 public name resolving to loopback is refused.
