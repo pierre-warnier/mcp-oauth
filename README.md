@@ -143,8 +143,17 @@ OpenAI's docs also describe a per-connection
   (`/healthz`): 120/min sustained, burst 40; 429 with `retry-after: 30`.
 - Ban (429) for 1 h after 10 authentication failures in 10 min. Failures are
   a bearer token never issued here (an expired one does not count), a wrong
-  owner password, a wrong client secret, a rejected client assertion, and
-  whatever the app reports through `AuthFailures`.
+  owner password, a wrong client secret, a rejected client assertion, a wrong
+  PKCE verifier for a live authorization code of that client (the client
+  that asked for the code holds its verifier, so this is a stolen code; the
+  code is burnt too), and whatever the app reports through `AuthFailures`.
+- Not counted, because real clients hit them: an unknown, expired or already
+  used authorization code (restarts, retries, races; a reused code still
+  revokes its grant), a code presented by another client, an unknown
+  `client_id`, and a CIMD `client_id` URL that is not on the allowlist, cannot
+  be fetched (timeout, network error, 5xx) or has an invalid document: a
+  Claude client whose metadata fetch timed out must not get its (often
+  shared) IP banned. Those only cost the rate limit.
 - Unknown paths: 404, rate-limited, never counted; logged on stderr as
   `debug: unknown path <METHOD> <path> from <ip>` (path without query).
 - Body cap 1 MiB, request timeout 120 s (408), 32 concurrent requests.

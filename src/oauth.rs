@@ -1912,6 +1912,13 @@ async fn token(
                 _ => {}
             }
             if !pkce_s256_ok(r.code_verifier.as_deref().unwrap_or(""), &p.code_challenge) {
+                // A live code of this very client with a wrong verifier: the
+                // client that asked for the code holds its verifier, so this
+                // is someone else with a stolen code. Counted (the code is
+                // burnt). Unknown, expired or used codes and unknown clients
+                // are not: real clients retry those after restarts.
+                drop(st);
+                record_failure(&failures, "oauth PKCE verifier");
                 return grant("PKCE verification failed");
             }
             let resource = o.0.resource.clone();

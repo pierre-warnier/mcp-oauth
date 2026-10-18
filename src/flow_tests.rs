@@ -828,3 +828,90 @@ async fn concurrent_logins_bounded() {
     assert!(buffers <= crate::DEFAULT_MAX_PASSWORD_CHECKS, "{buffers}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A wrong PKCE verifier for a live code counts as an authentication
+/// failure, the same way for a DCR client and for a CIMD client; unknown,
+/// expired or used codes, codes of another client and unknown client_ids do
+/// not (a real client hits those after a restart or a race).
+#[tokio::test]
+async fn pkce_mismatch_counts_for_dcr_and_cimd_clients() {
+    const BAD: &str = "xBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let cb = "https://claude.ai/api/mcp/auth_callback";
+    for kind in ["dcr", "cimd"] {
+        let dir = tmp_dir(&format!("pkce-{kind}"));
+        let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
+        let app = app_with(
+            &o,
+            Limits {
+                max_failures: 3,
+                per_ip_burst: 1000.0,
+                ..Default::default()
+            },
+        );
+        let id = if kind == "dcr" {
+            register(&app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#))
+                .await
+                .0
+        } else {
+            o.cimd().serve(CLAUDE, 200, CLAUDE_DOC.as_bytes());
+            CLAUDE.to_string()
+        };
+        // Not counted, however often: unknown code, unknown client_id, a
+        // live code presented by another client, a used code.
+        for _ in 0..4 {
+            let r = send(&app, form("/oauth/token", &exchange(&id, "nope", cb))).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{kind}: {}", r.body);
+            let r = send(
+                &app,
+                form("/oauth/token", &exchange("no-such-client", "x", cb)),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{kind}: {}", r.body);
+        }
+        let other = register(&app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#))
+            .await
+            .0;
+        let code = authorize(&app, &id, cb, &[]).await;
+        for _ in 0..3 {
+            let r = send(&app, form("/oauth/token", &exchange(&other, &code, cb))).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{kind}: {}", r.body);
+        }
+        let code = authorize(&app, &id, cb, &[]).await;
+        let r = send(&app, form("/oauth/token", &exchange(&id, &code, cb))).await;
+        tokens(&r);
+        for _ in 0..3 {
+            let r = send(&app, form("/oauth/token", &exchange(&id, &code, cb))).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{kind}: used code");
+        }
+        let (still, _) = o.issue_for_tests(&id, crate::oauth::unix_now());
+        assert_eq!(
+            send(&app, mcp(Some(&still))).await.status,
+            StatusCode::OK,
+            "{kind}: nothing above counted"
+        );
+        // Wrong verifier on live codes: counted, banned at the 3rd.
+        for i in 0..3 {
+            let code = authorize(&app, &id, cb, &[]).await;
+            let mut ex = exchange(&id, &code, cb);
+            ex.retain(|(k, _)| *k != "code_verifier");
+            if i != 1 {
+                ex.push(("code_verifier", BAD));
+            } // i == 1: no verifier at all
+            let r = send(&app, form("/oauth/token", &ex)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{kind}: {}", r.body);
+            assert!(r.body.contains("PKCE verification failed"), "{}", r.body);
+            // The code is burnt: the right verifier no longer works.
+            let r = send(&app, form("/oauth/token", &exchange(&id, &code, cb))).await;
+            if i < 2 {
+                assert_eq!(r.status, StatusCode::BAD_REQUEST, "{kind}: burnt");
+            }
+        }
+        let r = send(&app, mcp(Some(&still))).await;
+        assert_eq!(
+            (r.status, r.body.as_str()),
+            (StatusCode::TOO_MANY_REQUESTS, "banned"),
+            "{kind}: banned after 3 PKCE mismatches"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
