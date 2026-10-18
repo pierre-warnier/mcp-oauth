@@ -1,0 +1,37 @@
+[package]
+name = "mcp-oauth"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "OAuth 2.1 authorization server, bearer guard and abuse protection for single-owner MCP servers (axum)"
+publish = false
+
+[dependencies]
+argon2 = "0.6"
+# Already in every rustls/reqwest build (TLS provider); used here to verify
+# private_key_jwt client assertions (RS256, PS256, ES256).
+aws-lc-rs = { version = "1.18.2", default-features = false, features = ["aws-lc-sys"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+base64 = "0.23"
+getrandom = "0.4"
+hex = "0.4"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1.53.3", features = ["rt", "net"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["timeout", "limit"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+tower = { version = "0.5", features = ["util"] }
+
+# Argon2 is unusably slow unoptimised; keep tests and debug builds fast.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
