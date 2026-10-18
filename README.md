@@ -181,15 +181,21 @@ burst; base 13 MiB):
 | 1 | 31 MiB | 13 MiB | 32 MiB | 32 MiB | 1 x 401 |
 | 8 | 164 MiB | 13 MiB | 51 MiB | 51 MiB | 2 x 401, 6 x 503 |
 | 60 | 644 MiB | 643 MiB | 53 MiB | 53 MiB | 2 x 401, 58 x 503 |
-| 60, 20 bursts | 1165 MiB | 1164 MiB | 59 MiB | 59 MiB | 40 x 401, 1160 x 503 |
+| 60, 20 bursts | 1165 MiB | 1164 MiB | 61 MiB | 61 MiB | 40 x 401, 1160 x 503 |
 
-Why the buffers are kept: freed one by one, they do not go back to the
-system. glibc raises its mmap threshold to the size of the first freed
-19 MiB chunk, so later buffers come from the per-thread malloc arenas, whose
-free memory is kept. With the two slots but a fresh buffer per check, what
-stayed resident still grew with the bursts (62 MiB after 20 bursts of 60,
-67 MiB after 60 bursts). With kept buffers it is fixed at 2 x 19 MiB once
-the owner has signed in.
+The bound on concurrent checks is what removes both the peak and the
+retention: unbounded, every concurrent check got its own 19 MiB in its own
+malloc arena, and glibc keeps arena memory. Why the buffers are also kept:
+a buffer freed after each check does not reliably go back to the system
+either (glibc raises its mmap threshold to the size of the first freed
+19 MiB chunk, later ones come from the arenas), and how much stays depends
+on how many arenas glibc creates (up to 8 per core). Measured over 60 bursts
+of 60 (3600 checks): fresh buffers kept 52-53 MiB over base, kept buffers
+49-51 MiB, about the same here; but with kept buffers the argon2 share is
+exactly 2 x 19 MiB whatever the allocator and the core count, at the price
+of holding it from the first sign-in on (32 MiB RSS after one login instead
+of 13 MiB). The rest of the growth over many bursts is per-IP guard state
+and allocator overhead.
 
 All in `Limits`; `Limits::default()` is the above.
 

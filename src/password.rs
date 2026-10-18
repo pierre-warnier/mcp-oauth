@@ -9,15 +9,14 @@
 //! a login that finds no free slot is answered at once (503, see
 //! `authorize_post`), never queued. Each slot owns one working buffer that is
 //! allocated on first use and then reused: the argon2 memory of the whole
-//! process is at most `max` x `m` KiB, for good. Allocating it per call and
-//! freeing it does not give the memory back: glibc raises its mmap threshold
-//! to the size of the first freed 19 MiB chunk, so later buffers come from the
-//! per-thread malloc arenas, which keep it. Measured on kidctl (glibc 2.41,
-//! 20 cores, distinct IPs, before this module): 60 concurrent wrong passwords
-//! peaked at 644 MiB and kept 643 MiB; 20 such bursts kept 1.14 GiB. With the
-//! slots alone (per-call buffers) retention still grew with the bursts (49
-//! MiB over base after 20, 53 MiB after 60); with reused buffers it stays at
-//! 2 x 19 MiB over base. See the README.
+//! process is at most `max` x `m` KiB, for good, whatever the allocator
+//! does. Freed after each check, a buffer may stay in a glibc malloc arena
+//! (the mmap threshold rises to the size of the first freed 19 MiB chunk),
+//! and how much stays then depends on the number of arenas. Measured on
+//! kidctl (glibc 2.41, 20 cores, distinct IPs): unbounded, 60 concurrent
+//! wrong passwords peaked at 644 MiB and kept 643 MiB; bounded to 2, 3600
+//! checks kept 49-53 MiB over base with either kind of buffer. See the
+//! README.
 
 use argon2::{Algorithm, Argon2, Block, Params, PasswordHash, Version};
 use std::sync::atomic::{AtomicUsize, Ordering};
