@@ -1,0 +1,6 @@
+# src/testdata/cimd-test-leaf.key: test-only private key for the TLS leaf
+# certificate of `cimd.test` / `*.cimd.test`, used by the CIMD fetcher tests
+# (src/test_https.rs). It is signed by "mcp-oauth test CA", whose private key
+# is not committed, and it is trusted nowhere outside these tests.
+b524fb78fb345c8167a572a196cb73f289743eed:src/testdata/cimd-test-leaf.key:private-key:1
+src/testdata/cimd-test-leaf.key:private-key:1

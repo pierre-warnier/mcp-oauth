@@ -13,7 +13,7 @@
 //! does. Freed after each check, a buffer may stay in a glibc malloc arena
 //! (the mmap threshold rises to the size of the first freed 19 MiB chunk),
 //! and how much stays then depends on the number of arenas. Measured on
-//! kidctl (glibc 2.41, 20 cores, distinct IPs): unbounded, 60 concurrent
+//! a glibc 2.41, 20-core server (distinct IPs): unbounded, 60 concurrent
 //! wrong passwords peaked at 644 MiB and kept 643 MiB; bounded to 2, 3600
 //! checks kept 49-53 MiB over base with either kind of buffer. See the
 //! README.

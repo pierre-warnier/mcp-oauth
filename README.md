@@ -5,8 +5,11 @@ own authorization server and its own protected resource, and one owner
 password guards the consent screen. Also the abuse protection that goes with
 an internet-facing endpoint. Rust 1.99, edition 2024, axum 0.8, tokio.
 
-Used by [youtube-get](../youtube-get) (path dependency for now; a git
-dependency once this repo has a remote).
+Extracted from a single-owner MCP server; use it as a git dependency:
+
+```toml
+mcp-oauth = { git = "https://github.com/pierre-warnier/mcp-oauth" }
+```
 
 ## API
 
@@ -172,7 +175,7 @@ OpenAI's docs also describe a per-connection
   checks never hold more than 2 x 19 MiB, however many requests come in. This
   lives in `OAuth`, not in `protect`, so it holds without the guard too.
 
-Memory of kidctl's release binary (glibc 2.41, 20 cores) for N concurrent
+Memory of a release binary on a glibc 2.41, 20-core server for N concurrent
 wrong passwords from N distinct IPs (`VmHWM` peak, `VmRSS` 15 s after the
 burst; base 13 MiB):
 

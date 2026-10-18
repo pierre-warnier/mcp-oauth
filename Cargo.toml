@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 description = "OAuth 2.1 authorization server, bearer guard and abuse protection for single-owner MCP servers (axum)"
+license = "MIT"
 publish = false
 
 [dependencies]
