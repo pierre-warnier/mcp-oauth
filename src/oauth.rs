@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,7 +83,9 @@ pub struct Config {
     /// `client_id` URL is accepted as a Client ID Metadata Document.
     /// `Some(urls)`: only these `client_id` URLs (exact match) are accepted
     /// via CIMD, and DCR is disabled (the registration endpoint answers 403
-    /// and is not advertised). Clients registered earlier keep working.
+    /// and is not advertised). New authorizations need an allowlisted
+    /// `client_id`; clients registered by DCR earlier are refused at the
+    /// authorization endpoint (see [`OAuth::with_dcr_grace`] for their tokens).
     pub cimd_allowlist: Option<Vec<String>>,
 }
 
@@ -618,6 +621,7 @@ impl TokenStore {
     }
 
     /// Grant for a live access token bound to `resource`.
+    #[cfg(test)]
     fn access(&self, token: &str, resource: &str, now: u64) -> Option<Grant> {
         match self.lookup(token, resource, now) {
             Access::Valid(g) => Some(g),
@@ -760,6 +764,8 @@ struct Inner {
     cfg: Config,
     resource: String,
     cimd: Cimd,
+    /// See [`OAuth::with_dcr_grace`].
+    dcr_grace: AtomicBool,
     st: Mutex<St>,
 }
 
@@ -835,6 +841,19 @@ impl OAuth {
         let tokens: TokensFile = read_json(&cfg.state_dir, TOKENS_FILE)?;
         let mut tokens = TokenStore::from_families(tokens.families);
         tokens.prune(unix_now());
+        if let Some(l) = &cfg.cimd_allowlist {
+            let outside = tokens
+                .fams
+                .values()
+                .filter(|f| !l.contains(&f.client_id))
+                .count();
+            eprintln!(
+                "oauth: dynamic client registration closed ({} allowlisted client_id URLs); \
+                 {outside} token families of other clients kept until their refresh \
+                 tokens expire, unless dcr_grace is turned off",
+                l.len(),
+            );
+        }
         let resource = format!("{}{}", cfg.issuer, cfg.mcp_path);
         let st = St {
             clients: clients
@@ -852,8 +871,39 @@ impl OAuth {
             cfg,
             resource,
             cimd,
+            dcr_grace: AtomicBool::new(true),
             st: Mutex::new(st),
         })))
+    }
+
+    /// Only matters with a [`Config::cimd_allowlist`]. `true` (the default):
+    /// token families issued before the allowlist to clients outside it
+    /// (DCR clients) keep working, access tokens validate and refresh tokens
+    /// rotate, until their refresh token expires; nothing breaks for
+    /// connections that already exist. `false`: those clients are cut off at
+    /// once (their access tokens are rejected, refresh is refused). Either
+    /// way they cannot start a new authorization.
+    pub fn with_dcr_grace(self, grace: bool) -> Self {
+        self.0.dcr_grace.store(grace, Ordering::Relaxed);
+        if !grace && let Some(l) = &self.0.cfg.cimd_allowlist {
+            let outside = self
+                .lock()
+                .tokens
+                .fams
+                .values()
+                .filter(|f| !l.contains(&f.client_id))
+                .count();
+            eprintln!(
+                "oauth: dcr_grace off: {outside} token families of clients outside the \
+                 allowlist are no longer honoured"
+            );
+        }
+        self
+    }
+
+    /// See [`Self::with_dcr_grace`].
+    pub fn dcr_grace(&self) -> bool {
+        self.0.dcr_grace.load(Ordering::Relaxed)
     }
 
     /// Tests: an instance whose CIMD documents come from memory.
@@ -880,6 +930,25 @@ impl OAuth {
         }
     }
 
+    /// Whether tokens already issued to `client_id` are honoured (bearer
+    /// check and refresh): always without an allowlist or with
+    /// [`Self::with_dcr_grace`], otherwise only for allowlisted clients.
+    fn tokens_honoured(&self, client_id: &str) -> bool {
+        self.dcr_grace() || self.cimd_allowed(client_id)
+    }
+
+    /// Bearer lookup, with the allowlist applied to the token's client.
+    fn lookup(&self, token: &str) -> Access {
+        match self
+            .lock()
+            .tokens
+            .lookup(token, &self.0.resource, unix_now())
+        {
+            Access::Valid(g) if !self.tokens_honoured(&g.client_id) => Access::Stale,
+            a => a,
+        }
+    }
+
     /// The protected resource (MCP endpoint URL), e.g. `https://host/mcp`.
     pub fn resource(&self) -> &str {
         &self.0.resource
@@ -891,9 +960,10 @@ impl OAuth {
 
     /// Grant for a bearer access token, if valid for this resource now.
     pub fn validate(&self, token: &str) -> Option<Grant> {
-        self.lock()
-            .tokens
-            .access(token, &self.0.resource, unix_now())
+        match self.lookup(token) {
+            Access::Valid(g) => Some(g),
+            _ => None,
+        }
     }
 
     /// Layer for the protected route(s): a valid bearer token (issued here,
@@ -908,7 +978,7 @@ impl OAuth {
 
     /// The bearer check of [`BearerLayer`].
     fn authenticate(&self, h: &HeaderMap) -> Result<Grant, BearerRejection> {
-        let found = bearer(h).map(|t| self.lock().tokens.lookup(t, &self.0.resource, unix_now()));
+        let found = bearer(h).map(|t| self.lookup(t));
         match found {
             Some(Access::Valid(g)) => Ok(g),
             Some(Access::Unknown) => Err(BearerRejection {
@@ -1235,6 +1305,8 @@ struct ClientInfo {
 }
 
 const UNKNOWN_CLIENT: &str = "Unknown client. Remove the connector and add it again.";
+const DCR_CLOSED: &str =
+    "This client registration is no longer accepted. Remove the connector and add it again.";
 
 impl OAuth {
     /// A registered (DCR) client, or a Client ID Metadata Document when the
@@ -1244,6 +1316,13 @@ impl OAuth {
             return Err(UNKNOWN_CLIENT.into());
         };
         if let Some(c) = self.lock().clients.get(id) {
+            if !self.dcr_enabled() {
+                eprintln!(
+                    "oauth: client_id {id} was registered by DCR, which is closed; \
+                     new authorizations need an allowlisted client_id"
+                );
+                return Err(DCR_CLOSED.into());
+            }
             return Ok(ClientInfo {
                 client_id: c.client_id.clone(),
                 redirect_uris: c.redirect_uris.clone(),
@@ -1731,6 +1810,24 @@ async fn token(
             "client assertions are only accepted from Client ID Metadata Document clients",
         )
         .into_response();
+    }
+    // DCR closed (allowlist): a client registered earlier may only refresh
+    // the tokens it holds, and only during the grace.
+    if registered && !o.dcr_enabled() {
+        let refresh = r.grant_type.as_deref() == Some("refresh_token");
+        if !(refresh && o.tokens_honoured(&client_id)) {
+            eprintln!(
+                "oauth: client_id {client_id} was registered by DCR, which is closed; \
+                 {} refused",
+                r.grant_type.as_deref().unwrap_or("grant")
+            );
+            return oerr(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "dynamic client registration is closed; use a Client ID Metadata Document",
+            )
+            .into_response();
+        }
     }
     let mut st = o.lock();
     // Registered client (DCR), unless it was evicted meanwhile.

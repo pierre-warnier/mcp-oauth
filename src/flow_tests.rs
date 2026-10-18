@@ -475,26 +475,82 @@ async fn cimd_private_key_jwt() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn refresh_req<'a>(client_id: &'a str, refresh: &'a str) -> Vec<(&'static str, &'a str)> {
+    vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh),
+        ("client_id", client_id),
+    ]
+}
+
+/// Register by DCR on `app`; `(client_id, client_secret)`.
+async fn register(app: &Router, body: &str) -> (String, Option<String>) {
+    let r = send(
+        app,
+        Request::post("/oauth/register")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let j = r.json();
+    (
+        j["client_id"].as_str().unwrap().to_string(),
+        j["client_secret"].as_str().map(str::to_string),
+    )
+}
+
+/// `(access, refresh)` of a token response.
+fn tokens(r: &Resp) -> (String, String) {
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let j = r.json();
+    (
+        j["access_token"].as_str().unwrap().to_string(),
+        j["refresh_token"].as_str().unwrap().to_string(),
+    )
+}
+
+fn allowlisted(dir: &std::path::Path, hash: &str, grace: bool) -> (OAuth, Router) {
+    let mut c = config(dir, hash);
+    c.cimd_allowlist = Some(vec![CLAUDE.into()]);
+    let o = OAuth::new_for_tests(c).unwrap();
+    assert!(o.dcr_grace(), "on by default");
+    let o = o.with_dcr_grace(grace);
+    let app = app_with(&o, Limits::default());
+    (o, app)
+}
+
 #[tokio::test]
 async fn allowlist_disables_dcr() {
     let dir = tmp_dir("allow");
     let hash = crate::hash_password(PW).unwrap();
     let cb = "https://claude.ai/api/mcp/auth_callback";
-    // A client registered by DCR before the allowlist was set...
+    let gpt = "https://chatgpt.com/connector_platform_oauth_redirect";
+    // Two clients registered by DCR before the allowlist was set (a public
+    // one, like Claude's, and a confidential one, like ChatGPT's), each
+    // holding a token family...
     let open = OAuth::new_for_tests(config(&dir, &hash)).unwrap();
-    let reg = Request::post("/oauth/register")
-        .body(Body::from(format!(r#"{{"redirect_uris":["{cb}"]}}"#)))
-        .unwrap();
-    assert_eq!(
-        send(&app_with(&open, Limits::default()), reg).await.status,
-        StatusCode::CREATED
-    );
-    drop(open);
-    // ...then the server restarts with an allowlist.
-    let mut c = config(&dir, &hash);
-    c.cimd_allowlist = Some(vec![CLAUDE.into()]);
-    let o = OAuth::new_for_tests(c).unwrap();
-    let app = app_with(&o, Limits::default());
+    let app = app_with(&open, Limits::default());
+    let (pub_id, _) = register(&app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#)).await;
+    let (conf_id, secret) = register(
+        &app,
+        &format!(
+            r#"{{"redirect_uris":["{gpt}"],"token_endpoint_auth_method":"client_secret_post"}}"#
+        ),
+    )
+    .await;
+    let secret = secret.expect("confidential client gets a secret");
+    let code = authorize(&app, &pub_id, cb, &[]).await;
+    let (pub_access, pub_refresh) =
+        tokens(&send(&app, form("/oauth/token", &exchange(&pub_id, &code, cb))).await);
+    let code = authorize(&app, &conf_id, gpt, &[]).await;
+    let mut ex = exchange(&conf_id, &code, gpt);
+    ex.push(("client_secret", &secret));
+    let (conf_access, conf_refresh) = tokens(&send(&app, form("/oauth/token", &ex)).await);
+    drop((open, app));
+
+    // ...then the server restarts with an allowlist (dcr_grace on).
+    let (o, app) = allowlisted(&dir, &hash, true);
     let r = send(&app, get("/.well-known/oauth-authorization-server")).await;
     let asm = r.json();
     assert!(asm.get("registration_endpoint").is_none(), "{asm}");
@@ -507,8 +563,8 @@ async fn allowlist_disables_dcr() {
     // Allowlisted CIMD client: fine.
     o.cimd().serve(CLAUDE, 200, CLAUDE_DOC.as_bytes());
     let code = authorize(&app, CLAUDE, cb, &["Claude"]).await;
-    let r = send(&app, form("/oauth/token", &exchange(CLAUDE, &code, cb))).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let (cimd_access, _) =
+        tokens(&send(&app, form("/oauth/token", &exchange(CLAUDE, &code, cb))).await);
     // Other URLs are refused, even with a valid document.
     o.cimd().serve(CHATGPT, 200, CHATGPT_DOC.as_bytes());
     let q =
@@ -518,20 +574,86 @@ async fn allowlist_disables_dcr() {
     assert!(r.body.contains("not allowed"), "{}", r.body);
     let r = send(&app, form("/oauth/token", &exchange(CHATGPT, "x", cb))).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-    // The client registered earlier still authorizes.
-    let stored: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("oauth-clients.json")).unwrap())
-            .unwrap();
-    let id = stored["clients"][0]["client_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let code = authorize(&app, &id, cb, &[]).await;
+
+    // Grace: the earlier DCR clients' access tokens still validate...
+    for (id, access) in [(&pub_id, &pub_access), (&conf_id, &conf_access)] {
+        let r = send(&app, mcp(Some(access))).await;
+        assert_eq!((r.status, r.body.as_str()), (StatusCode::OK, id.as_str()));
+        assert!(o.validate(access).is_some());
+    }
+    // ...their refresh tokens rotate (the confidential one still needs its secret)...
+    let r = send(
+        &app,
+        form("/oauth/token", &refresh_req(&pub_id, &pub_refresh)),
+    )
+    .await;
+    let (pub_access, pub_refresh) = tokens(&r);
+    let r = send(
+        &app,
+        form("/oauth/token", &refresh_req(&conf_id, &conf_refresh)),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "no secret: {}", r.body);
+    let mut rr = refresh_req(&conf_id, &conf_refresh);
+    rr.push(("client_secret", &secret));
+    let (conf_access, conf_refresh) = tokens(&send(&app, form("/oauth/token", &rr)).await);
+    for (id, access) in [(&pub_id, &pub_access), (&conf_id, &conf_access)] {
+        let r = send(&app, mcp(Some(access))).await;
+        assert_eq!((r.status, r.body.as_str()), (StatusCode::OK, id.as_str()));
+    }
+    // ...but they cannot start a new authorization, nor exchange a code.
+    for (id, uri) in [(&pub_id, cb), (&conf_id, gpt)] {
+        let q = serde_urlencoded::to_string([
+            ("response_type", "code"),
+            ("client_id", id.as_str()),
+            ("redirect_uri", uri),
+            ("code_challenge", challenge().as_str()),
+            ("code_challenge_method", "S256"),
+        ])
+        .unwrap();
+        let r = send(&app, get(&format!("/oauth/authorize?{q}"))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+        assert!(r.body.contains("no longer accepted"), "{}", r.body);
+    }
+    let r = send(&app, form("/oauth/token", &exchange(&pub_id, "x", cb))).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.json()["error"], "invalid_client");
+    drop((o, app));
+
+    // Restart with dcr_grace off: the DCR clients are cut off at once,
+    // the allowlisted client is not; nothing of this counts as a failure.
+    let (o, app) = allowlisted(&dir, &hash, false);
+    for access in [&pub_access, &conf_access] {
+        let r = send(&app, mcp(Some(access))).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        assert!(
+            r.headers[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .contains("invalid_token")
+        );
+        assert!(o.validate(access).is_none());
+    }
+    let r = send(
+        &app,
+        form("/oauth/token", &refresh_req(&pub_id, &pub_refresh)),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert_eq!(r.json()["error"], "invalid_client");
+    let mut rr = refresh_req(&conf_id, &conf_refresh);
+    rr.push(("client_secret", &secret));
+    let r = send(&app, form("/oauth/token", &rr)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    let r = send(&app, mcp(Some(&cimd_access))).await;
+    assert_eq!((r.status, r.body.as_str()), (StatusCode::OK, CLAUDE));
+    // The state is untouched: turning the grace back on restores them.
+    drop((o, app));
+    let (_o, app) = allowlisted(&dir, &hash, true);
+    let r = send(&app, mcp(Some(&pub_access))).await;
     assert_eq!(
-        send(&app, form("/oauth/token", &exchange(&id, &code, cb)))
-            .await
-            .status,
-        StatusCode::OK
+        (r.status, r.body.as_str()),
+        (StatusCode::OK, pub_id.as_str())
     );
     let _ = std::fs::remove_dir_all(dir);
 }

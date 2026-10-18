@@ -35,6 +35,7 @@ let app = protect(app, Guard::new(Limits::default()));
 |---|---|
 | `Config` | issuer, `mcp_path`, `owner_password_hash` (argon2id PHC), `state_dir`, `redirect_patterns`, `resource_name`, `cimd_allowlist` |
 | `OAuth::new(Config) -> Result<OAuth, String>` | validates the config, creates `state_dir` (mode 700), loads `oauth-clients.json` and `oauth-tokens.json` |
+| `OAuth::with_dcr_grace(bool) -> OAuth` | with an allowlist, whether tokens already held by clients outside it keep working (default `true`, below) |
 | `OAuth::router()` | `/.well-known/oauth-protected-resource` (also `+ mcp_path`), `/.well-known/oauth-authorization-server`, `/oauth/authorize` (login + consent pages), `/oauth/token`, `/oauth/register`, `/oauth/revoke` |
 | `OAuth::bearer_layer()` | tower layer for any route: a valid token puts a `Grant { client_id, scope }` in the request extensions, otherwise `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource"` (`error="invalid_token"` when a token was sent) |
 | `OAuth::validate(token)` | the same check by hand |
@@ -96,8 +97,28 @@ any https `client_id` URL is accepted as a metadata document.
 `cimd_allowlist: Some(urls)`: only those `client_id` URLs (exact string match)
 are accepted through CIMD, Dynamic Client Registration is off
 (`/oauth/register` answers 403 and `registration_endpoint` disappears from the
-metadata, as do the shared-secret auth methods). Clients registered earlier
-keep working; remove them from `oauth-clients.json` to cut them off.
+metadata, as do the shared-secret auth methods). Every new authorization
+needs an allowlisted `client_id`: a client registered by DCR earlier gets an
+error page at `/oauth/authorize` ("Remove the connector and add it again") and
+`invalid_client` for an authorization code.
+
+`OAuth::with_dcr_grace(grace)` (only with an allowlist) decides what happens to the tokens such
+clients (DCR, or a CIMD URL outside the list) already hold:
+
+- `true` (the default): their access tokens keep validating and a DCR
+  client keeps rotating its refresh token (still authenticating with its
+  secret if it has one), so existing connections do not break. The grace ends
+  when a refresh token expires (`REFRESH_TTL`, 30 days without use) or is
+  revoked; the client then has to connect again, through CIMD. A CIMD client
+  outside the list cannot refresh (its document is refused), so its access
+  token simply runs out (`ACCESS_TTL`).
+- `false`: cut off at once. Their access tokens get `401 invalid_token` (not
+  counted as an authentication failure) and refresh gets `invalid_client`.
+  Nothing is deleted: setting it back to `true` restores them.
+
+At start the server logs `oauth: dynamic client registration closed (N
+allowlisted client_id URLs); M token families of other clients kept ...`, and
+`with_dcr_grace(false)` logs how many families it cuts off.
 
 Recommended allowlist, the published client_id URLs (checked 2026-10-18; each
 document names itself and validates against the default redirect patterns):
