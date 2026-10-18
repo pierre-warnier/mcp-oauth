@@ -26,7 +26,7 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["timeout", "limit"] }
 
 [dev-dependencies]
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tower = { version = "0.5", features = ["util"] }
 
 # Argon2 is unusably slow unoptimised; keep tests and debug builds fast.

@@ -9,6 +9,7 @@
 use crate::cimd::{AuthMethod, Cimd, CimdError};
 use crate::guard::AuthFailures;
 use crate::jwt;
+use crate::password::{DEFAULT_MAX_PASSWORD_CHECKS, OwnerPassword};
 use axum::{
     Extension, Router,
     body::Bytes,
@@ -120,28 +121,6 @@ pub fn hash_password(password: &str) -> Result<String, String> {
         .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| e.to_string())
-}
-
-fn check_password_hash(hash: &str) -> Result<(), String> {
-    let h = argon2::PasswordHash::new(hash)
-        .map_err(|e| format!("owner password hash is not a PHC string: {e}"))?;
-    if h.algorithm != argon2::ARGON2ID_IDENT {
-        return Err(format!(
-            "owner password hash must be argon2id, got {}",
-            h.algorithm
-        ));
-    }
-    Ok(())
-}
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    use argon2::PasswordVerifier;
-    let Ok(h) = argon2::PasswordHash::new(hash) else {
-        return false;
-    };
-    argon2::Argon2::default()
-        .verify_password(password.as_bytes(), &h)
-        .is_ok()
 }
 
 // ---------------------------------------------------------------- PKCE
@@ -764,6 +743,7 @@ struct Inner {
     cfg: Config,
     resource: String,
     cimd: Cimd,
+    password: Arc<OwnerPassword>,
     /// See [`OAuth::with_dcr_grace`].
     dcr_grace: AtomicBool,
     st: Mutex<St>,
@@ -818,7 +798,10 @@ impl OAuth {
         if !cfg.mcp_path.starts_with('/') {
             return Err(format!("mcp_path must start with /, got {}", cfg.mcp_path));
         }
-        check_password_hash(&cfg.owner_password_hash)?;
+        let password = Arc::new(OwnerPassword::new(
+            &cfg.owner_password_hash,
+            DEFAULT_MAX_PASSWORD_CHECKS,
+        )?);
         if cfg.redirect_patterns.is_empty() {
             return Err("no redirect URI patterns".into());
         }
@@ -871,6 +854,7 @@ impl OAuth {
             cfg,
             resource,
             cimd,
+            password,
             dcr_grace: AtomicBool::new(true),
             st: Mutex::new(st),
         })))
@@ -906,6 +890,23 @@ impl OAuth {
         self.0.dcr_grace.load(Ordering::Relaxed)
     }
 
+    /// At most `n` owner password checks run at once (default
+    /// [`DEFAULT_MAX_PASSWORD_CHECKS`], minimum 1); a sign-in beyond that is
+    /// answered at once with 503 and `Retry-After`, without checking the
+    /// password. Each check holds one argon2 working buffer (`m` KiB of the
+    /// owner password hash, 19 MiB for [`hash_password`]), allocated on first
+    /// use and kept for the next check: the password checks never take more
+    /// than `n` x `m` KiB.
+    pub fn with_max_password_checks(self, n: usize) -> Self {
+        self.0.password.set_max(n);
+        self
+    }
+
+    /// Owner password checks allowed at once (see [`Self::with_max_password_checks`]).
+    pub fn max_password_checks(&self) -> usize {
+        self.0.password.max()
+    }
+
     /// Tests: an instance whose CIMD documents come from memory.
     #[cfg(test)]
     pub(crate) fn new_for_tests(cfg: Config) -> Result<Self, String> {
@@ -916,6 +917,11 @@ impl OAuth {
     #[cfg(test)]
     pub(crate) fn cimd(&self) -> &Cimd {
         &self.0.cimd
+    }
+
+    #[cfg(test)]
+    pub(crate) fn password_pool(&self) -> &Arc<OwnerPassword> {
+        &self.0.password
     }
 
     /// Whether Dynamic Client Registration is open (no CIMD allowlist).
@@ -1458,6 +1464,9 @@ fn record_failure(f: &Option<Extension<AuthFailures>>, what: &str) {
     }
 }
 
+const BUSY: &str = "Too many sign-ins in progress, try again in a few seconds.";
+const BUSY_RETRY_AFTER: &str = "2";
+
 async fn authorize_post(
     State(o): State<OAuth>,
     failures: Option<Extension<AuthFailures>>,
@@ -1475,9 +1484,24 @@ async fn authorize_post(
                 Checked::Redirect(r) => return r,
                 Checked::Ok(p, n) => (p, n),
             };
+            // Bounded: at most max_password_checks argon2 runs (19 MiB each)
+            // at once; beyond that answer now, without queueing.
+            let Some(slot) = o.0.password.try_slot() else {
+                eprintln!("oauth: owner password check refused, all slots busy");
+                let mut r = html(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &login_page(&o, &f.p, &pending, &label, Some(BUSY)),
+                );
+                r.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_static(BUSY_RETRY_AFTER),
+                );
+                return r;
+            };
             let pw = f.password.unwrap_or_default();
-            let hash = o.0.cfg.owner_password_hash.clone();
-            let ok = tokio::task::spawn_blocking(move || verify_password(&pw, &hash))
+            // The slot moves into the blocking task: it is released when
+            // argon2 is done, even if this request is cancelled meanwhile.
+            let ok = tokio::task::spawn_blocking(move || slot.verify(&pw))
                 .await
                 .unwrap_or(false);
             if !ok {
@@ -2168,11 +2192,15 @@ pub(crate) mod tests {
     fn password_hash_roundtrip() {
         let h = hash_password("correct horse battery staple").unwrap();
         assert!(h.starts_with("$argon2id$v=19$"), "{h}");
-        check_password_hash(&h).unwrap();
-        assert!(verify_password("correct horse battery staple", &h));
-        assert!(!verify_password("correct horse battery stapl", &h));
-        assert!(check_password_hash("$argon2i$v=19$m=16,t=2,p=1$c2FsdHNhbHQ$Zm9v").is_err());
-        assert!(check_password_hash("plain").is_err());
+        let pw = Arc::new(OwnerPassword::new(&h, 1).unwrap());
+        assert!(
+            pw.try_slot()
+                .unwrap()
+                .verify("correct horse battery staple")
+        );
+        assert!(!pw.try_slot().unwrap().verify("correct horse battery stapl"));
+        assert!(OwnerPassword::new("$argon2i$v=19$m=16,t=2,p=1$c2FsdHNhbHQ$Zm9v", 1).is_err());
+        assert!(OwnerPassword::new("plain", 1).is_err());
     }
 
     #[test]

@@ -36,6 +36,7 @@ let app = protect(app, Guard::new(Limits::default()));
 | `Config` | issuer, `mcp_path`, `owner_password_hash` (argon2id PHC), `state_dir`, `redirect_patterns`, `resource_name`, `cimd_allowlist` |
 | `OAuth::new(Config) -> Result<OAuth, String>` | validates the config, creates `state_dir` (mode 700), loads `oauth-clients.json` and `oauth-tokens.json` |
 | `OAuth::with_dcr_grace(bool) -> OAuth` | with an allowlist, whether tokens already held by clients outside it keep working (default `true`, below) |
+| `OAuth::with_max_password_checks(n) -> OAuth` | owner password checks running at once, default `DEFAULT_MAX_PASSWORD_CHECKS` = 2 (below) |
 | `OAuth::router()` | `/.well-known/oauth-protected-resource` (also `+ mcp_path`), `/.well-known/oauth-authorization-server`, `/oauth/authorize` (login + consent pages), `/oauth/token`, `/oauth/register`, `/oauth/revoke` |
 | `OAuth::bearer_layer()` | tower layer for any route: a valid token puts a `Grant { client_id, scope }` in the request extensions, otherwise `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource"` (`error="invalid_token"` when a token was sent) |
 | `OAuth::validate(token)` | the same check by hand |
@@ -147,6 +148,32 @@ OpenAI's docs also describe a per-connection
 - Unknown paths: 404, rate-limited, never counted; logged on stderr as
   `debug: unknown path <METHOD> <path> from <ip>` (path without query).
 - Body cap 1 MiB, request timeout 120 s (408), 32 concurrent requests.
+- Owner password checks (argon2id, 19 MiB of memory each with
+  `hash_password`): at most 2 at once (`OAuth::with_max_password_checks`).
+  A sign-in that finds both busy gets the login page again at once with
+  `503` and `Retry-After: 2`; its password is not checked and nothing is
+  counted. Each slot keeps its argon2 buffer for the next check, so password
+  checks never hold more than 2 x 19 MiB, however many requests come in. This
+  lives in `OAuth`, not in `protect`, so it holds without the guard too.
+
+Memory of kidctl's release binary (glibc 2.41, 20 cores) for N concurrent
+wrong passwords from N distinct IPs (`VmHWM` peak, `VmRSS` 15 s after the
+burst; base 13 MiB):
+
+| N concurrent | before: peak | before: kept | after: peak | after: kept | after: answers |
+|---|---|---|---|---|---|
+| 1 | 31 MiB | 13 MiB | 32 MiB | 32 MiB | 1 x 401 |
+| 8 | 164 MiB | 13 MiB | 51 MiB | 51 MiB | 2 x 401, 6 x 503 |
+| 60 | 644 MiB | 643 MiB | 53 MiB | 53 MiB | 2 x 401, 58 x 503 |
+| 60, 20 bursts | 1165 MiB | 1164 MiB | 59 MiB | 59 MiB | 40 x 401, 1160 x 503 |
+
+Why the buffers are kept: freed one by one, they do not go back to the
+system. glibc raises its mmap threshold to the size of the first freed
+19 MiB chunk, so later buffers come from the per-thread malloc arenas, whose
+free memory is kept. With the two slots but a fresh buffer per check, what
+stayed resident still grew with the bursts (62 MiB after 20 bursts of 60,
+67 MiB after 60 bursts). With kept buffers it is fixed at 2 x 19 MiB once
+the owner has signed in.
 
 All in `Limits`; `Limits::default()` is the above.
 

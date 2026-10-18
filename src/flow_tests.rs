@@ -712,3 +712,119 @@ async fn failures_that_count_and_those_that_do_not() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Login form for a DCR client registered on `app` (wrong password unless `pw`).
+async fn login_form(app: &Router) -> Vec<(&'static str, String)> {
+    let cb = "https://claude.ai/api/mcp/auth_callback";
+    let (id, _) = register(app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#)).await;
+    vec![
+        ("response_type", "code".into()),
+        ("client_id", id),
+        ("redirect_uri", cb.into()),
+        ("state", "st-1".into()),
+        ("code_challenge", challenge()),
+        ("code_challenge_method", "S256".into()),
+        ("step", "login".into()),
+    ]
+}
+
+fn login_req(f: &[(&'static str, String)], password: &str, ip: &str) -> Request<Body> {
+    let mut f: Vec<(&str, &str)> = f.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    f.push(("password", password));
+    Request::post("/oauth/authorize")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("cf-connecting-ip", ip)
+        .body(Body::from(serde_urlencoded::to_string(&f).unwrap()))
+        .unwrap()
+}
+
+/// All password slots busy: the login is answered at once with 503 and
+/// Retry-After, the login page is shown again (form kept), no failure is
+/// counted and no password is checked.
+#[tokio::test]
+async fn password_checks_bounded() {
+    let dir = tmp_dir("pwbusy");
+    let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
+    assert_eq!(o.max_password_checks(), crate::DEFAULT_MAX_PASSWORD_CHECKS);
+    assert_eq!(crate::DEFAULT_MAX_PASSWORD_CHECKS, 2);
+    let app = app_with(
+        &o,
+        Limits {
+            max_failures: 2,
+            ..Default::default()
+        },
+    );
+    let f = login_form(&app).await;
+    let pool = o.password_pool().clone();
+    let held = [pool.try_slot().unwrap(), pool.try_slot().unwrap()];
+    for _ in 0..5 {
+        let r = send(&app, login_req(&f, "wrong password", IP)).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+        assert_eq!(r.headers[header::RETRY_AFTER], "2");
+        assert!(
+            r.body.contains("Too many sign-ins in progress"),
+            "{}",
+            r.body
+        );
+        assert!(r.body.contains(r#"name="password""#), "login form kept");
+    }
+    // Even the right password is refused while busy (it is never looked at).
+    let r = send(&app, login_req(&f, PW, IP)).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pool.usage(), (2, 0), "nothing allocated by refused logins");
+    drop(held);
+    // 503s were not failures: one wrong password is not a ban (max 2).
+    let r = send(&app, login_req(&f, "wrong password", IP)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    let r = send(&app, login_req(&f, PW, IP)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains(r#"name="ticket""#));
+    assert_eq!(pool.usage(), (0, 1), "one buffer, reused");
+    // Configurable.
+    let o = o.with_max_password_checks(1);
+    assert_eq!(o.max_password_checks(), 1);
+    let _held = pool.try_slot().unwrap();
+    let r = send(&app, login_req(&f, PW, IP)).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 16 simultaneous wrong passwords from 16 IPs: never more than
+/// DEFAULT_MAX_PASSWORD_CHECKS argon2 buffers; the others get 503 at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_logins_bounded() {
+    let dir = tmp_dir("pwconc");
+    let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
+    let app = app_with(&o, Limits::default());
+    let f = login_form(&app).await;
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let (app, f, start) = (app.clone(), f.clone(), start.clone());
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            let ip = format!("203.0.113.{}", i + 1);
+            send(&app, login_req(&f, "wrong password", &ip))
+                .await
+                .status
+        }));
+    }
+    let mut codes = Vec::new();
+    for t in tasks {
+        codes.push(t.await.unwrap());
+    }
+    let wrong = codes
+        .iter()
+        .filter(|c| **c == StatusCode::UNAUTHORIZED)
+        .count();
+    let busy = codes
+        .iter()
+        .filter(|c| **c == StatusCode::SERVICE_UNAVAILABLE)
+        .count();
+    assert_eq!(wrong + busy, 16, "{codes:?}");
+    assert!(wrong >= 1 && busy >= 1, "{codes:?}");
+    let (running, buffers) = o.password_pool().usage();
+    assert_eq!(running, 0);
+    assert!(buffers <= crate::DEFAULT_MAX_PASSWORD_CHECKS, "{buffers}");
+    let _ = std::fs::remove_dir_all(dir);
+}

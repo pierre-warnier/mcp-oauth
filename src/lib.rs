@@ -53,6 +53,7 @@ mod cimd;
 mod guard;
 mod jwt;
 mod oauth;
+mod password;
 
 #[cfg(test)]
 mod flow_tests;
@@ -62,3 +63,4 @@ pub use oauth::{
     ACCESS_TTL, BearerLayer, BearerService, Config, DEFAULT_REDIRECT_PATTERNS, Grant, OAuth,
     REFRESH_TTL, check_pattern, hash_password,
 };
+pub use password::DEFAULT_MAX_PASSWORD_CHECKS;
